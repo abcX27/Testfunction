@@ -1,0 +1,177 @@
+<?php
+
+class QuestionCopyService
+{
+    /**
+     * @var QuestionBankRepository
+     */
+    protected $questionBankRepository;
+
+    /**
+     * @var QuestionRepository
+     */
+    protected $questionRepository;
+
+    public function __construct(QuestionBankRepository $questionBankRepository, QuestionRepository $questionRepository)
+    {
+        $this->questionBankRepository = $questionBankRepository;
+        $this->questionRepository = $questionRepository;
+    }
+
+    public function copyV1($ids, $params)
+    {
+        try {
+            // 参数校验...
+            $this->copyParamsCheck($params);
+            
+            $oldOrigin = $params['old_origin'] ?? [];
+            $newOrigins = $params['new_origin'] ?? [];
+
+            // 获取要处理的题目ID列表
+            if ($ids === 0) {
+                // 跨页全选，如果 oldOrigin 为空，这可能是一个潜在问题
+                if (empty($oldOrigin)) {
+                    throw new FailedException('缺少源题库信息');
+                }
+                $ids = QuestQuestionBank::getQuestionIdsByOrigin($oldOrigin[0])->unique()->toArray();
+            } else {
+                $ids = array_unique(array_column($oldOrigin, 'ques_id'));
+            }
+
+            if (empty($ids)) {
+                throw new FailedException('请选择要转移的题目');
+            }
+
+            $this->questionBankRepository->beginTransaction();
+
+            $totalCopied = 0;
+            $existingQuestions = [];
+
+            // 构造任务列表，将所有 源-目标 组合扁平化
+            $tasks = [];
+            foreach ($oldOrigin as $oldItem) {
+                foreach ($newOrigins as $newOrigin) {
+                    $tasks[] = [
+                        'old' => $oldItem,
+                        'new' => $newOrigin,
+                        'ids' => $ids
+                    ];
+                }
+            }
+
+            foreach ($tasks as $task) {
+                $oldItem = $task['old'];
+                $newOrigin = $task['new'];
+                $idsToProcess = $task['ids'];
+
+                $oldBankId = $oldItem['bank_id'];
+                $oldSubjectId = $oldItem['subject_id'];
+                $newBankId = $newOrigin['bank_id'];
+                $newSubjectId = $newOrigin['subject_id'];
+
+                // 根据题库和科目判断复制方式
+                if ($oldBankId === $newBankId && $oldSubjectId === $newSubjectId) {
+                    // 情况 A: 同题库同科目 - 只新增关系
+                    $this->checkQuestionPointName($idsToProcess, $oldBankId, $oldItem['school_id'], $newSubjectId);
+
+                    $existingQuestionIds = $this->findExistingQuestions($idsToProcess, $newOrigin);
+                    $idsToAdd = array_diff($idsToProcess, $existingQuestionIds);
+
+                    if (!empty($idsToAdd)) {
+                        $this->quesBankRepository->grow('ques_amount', $newOrigin['bank_id'], count($idsToAdd));
+                        $this->insertQuestQuestionBank($idsToAdd, $newOrigin);
+                    }
+                    $existingQuestions = array_merge($existingQuestions, $existingQuestionIds);
+
+                } else {
+                    // 情况 B: 跨题库或跨科目 - 完整复制
+                    $pointMapping = $this->checkQuestionPointNameV1($idsToProcess, $oldBankId, $oldItem['school_id'], $newSubjectId);
+
+                    $existingQuestionIds = $this->findExistingQuestions($idsToProcess, $newOrigin);
+                    $idsToCopy = array_diff($idsToProcess, $existingQuestionIds);
+
+                    if (!empty($idsToCopy)) {
+                        $copiedIdsMapping = $this->questionRepository->duplicateQuestions($idsToCopy);
+                        $this->insertQuestionRelations($copiedIdsMapping, $pointMapping, $newOrigin);
+                        $totalCopied += count($idsToCopy);
+                    }
+                    $existingQuestions = array_merge($existingQuestions, $existingQuestionIds);
+                }
+            }
+
+            $this->questionBankRepository->commit();
+
+            return [
+                'count' => $totalCopied,
+                'question' => $this->errQuestion([], array_unique($existingQuestions)),
+                'exisitCount' => count(array_unique($existingQuestions))
+            ];
+
+        } catch (\Exception $e) {
+            $this->questionBankRepository->rollBack();
+            throw new FailedException('复制失败：' . $e->getMessage());
+        }
+    }
+
+    /**
+     * 新增 QuestQuestionBank 关系
+     */
+    private function insertQuestQuestionBank(array $ids, array $newOrigin): void
+    {
+        $data = [];
+        foreach ($ids as $quesId) {
+            $data[] = [
+                'ques_id' => $quesId,
+                'bank_id' => $newOrigin['bank_id'],
+                'subject_id' => $newOrigin['subject_id'] ?? 0,
+                'school_id' => $newOrigin['school_id'] ?? 0,
+                'classify_id' => $newOrigin['classify_id_2'] ?? 0,
+                'distribute' => !empty($newOrigin['classify_id_2']) ? 1 : 0,
+                'created_at' => time(),
+                'updated_at' => time(),
+            ];
+        }
+        
+        if (!empty($data)) {
+            foreach (array_chunk($data, 1000) as $chunk) {
+                QuestQuestionBank::insert($chunk);
+            }
+        }
+    }
+    
+    /**
+     * 插入新的题目关系和知识点关系
+     */
+    private function insertQuestionRelations(array $copiedIdsMapping, array $pointMapping, array $newOrigin): void
+    {
+        // 批量插入 QuestQuestionBank 关系
+        $questionBankData = [];
+        foreach ($copiedIdsMapping as $newQuesId) {
+            $questionBankData[] = [
+                'ques_id' => $newQuesId,
+                // ... (其他字段)
+            ];
+        }
+        $this->insertQuestQuestionBank(array_values($copiedIdsMapping), $newOrigin);
+
+        // 批量插入 QuesRelatePoint 关系
+        $pointRelations = [];
+        foreach ($copiedIdsMapping as $oldId => $newId) {
+            // 确保旧题目有知识点映射
+            if (isset($pointMapping[$oldId])) {
+                foreach ($pointMapping[$oldId] as $pointId) {
+                    $pointRelations[] = [
+                        'ques_id' => $newId,
+                        'ques_point_id' => $pointId,
+                        'ques_bank_id' => $newOrigin['bank_id'],
+                    ];
+                }
+            }
+        }
+        if (!empty($pointRelations)) {
+            QuestRelatePoint::insert($pointRelations);
+        }
+    }
+    
+    // ... 其他辅助方法保持不变 (checkQuestionPointName, checkQuestionPointNameV1, findExistingQuestions)
+}
